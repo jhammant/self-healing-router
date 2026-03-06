@@ -16,6 +16,20 @@ class ToolStatus(Enum):
     UNKNOWN = "unknown"
 
 
+class CircuitBreakerState(Enum):
+    """Circuit breaker states for tool health."""
+    CLOSED = "closed"        # Normal operation
+    OPEN = "open"            # Tool confirmed down, weight = infinity
+    HALF_OPEN = "half_open"  # Recovery suspected, send one probe
+
+
+class ExecutionOutcome(Enum):
+    """Outcome of a routing execution."""
+    SUCCESS = "success"            # Completed via rerouted or primary path
+    ESCALATED = "escalated"        # LLM was called, may have demoted goal
+    MAX_REROUTES = "max_reroutes"  # Hit reroute limit
+
+
 @dataclass
 class ToolNode:
     """A tool in the routing graph."""
@@ -60,6 +74,15 @@ class HealthReport:
 
 
 @dataclass
+class GoalDemotion:
+    """Represents a demotion from original goal to a lesser goal."""
+    original_goal: str
+    demoted_goal: str
+    reason: str
+    fallback_action: str | None = None
+
+
+@dataclass
 class RouteResult:
     """Result of a routing attempt."""
     path: list[str]
@@ -69,6 +92,8 @@ class RouteResult:
     reroutes: int = 0
     llm_calls: int = 0
     errors: list[str] = field(default_factory=list)
+    outcome: ExecutionOutcome = ExecutionOutcome.SUCCESS
+    execution_log: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -78,6 +103,7 @@ class EscalationResult:
     detail: str = ""
     alternative_path: list[str] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    demotion: GoalDemotion | None = None
 
 
 # Type aliases for callbacks

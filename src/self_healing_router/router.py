@@ -11,18 +11,23 @@ This achieves 93% fewer LLM calls than ReAct while matching correctness.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
 from .graph import ToolGraph
 from .monitor import MonitorRegistry
 from .escalation import EscalationHandler, default_escalation
+from .priority import PriorityArbiter
 from .types import (
     RouteResult,
     ToolStatus,
     EscalationResult,
     EscalationCallback,
+    ExecutionOutcome,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SelfHealingRouter:
@@ -91,6 +96,21 @@ class SelfHealingRouter:
                 else:
                     edge.current_weight = edge.base_weight * penalty
 
+    def _collect_priority_signals(self) -> None:
+        """Collect priority signals from all monitors and log the winner."""
+        arbiter = PriorityArbiter()
+        for report in self.monitors.all_reports():
+            monitor = self.monitors.get(report.tool_name)
+            if monitor:
+                signal = monitor.priority_signal()
+                arbiter.add_signal(signal)
+        winner = arbiter.resolve()
+        if winner:
+            logger.debug(
+                "Priority winner: %s (score=%.2f, source=%s, detail=%s)",
+                winner.name, winner.score, winner.source, winner.detail,
+            )
+
     def _execute_tool(self, name: str, input_data: dict[str, Any]) -> tuple[bool, Any]:
         """Execute a single tool, recording metrics."""
         node = self.graph.get_tool(name)
@@ -135,8 +155,13 @@ class SelfHealingRouter:
         errors: list[str] = []
         attempted_paths: list[list[str]] = []
         executed: set[str] = set()
+        execution_log: list[dict[str, Any]] = []
+        outcome = ExecutionOutcome.SUCCESS
 
         while reroutes <= self._max_reroutes:
+            # Collect priority signals before routing
+            self._collect_priority_signals()
+
             # Sync edge weights from monitors
             self._sync_monitor_weights()
 
@@ -146,12 +171,22 @@ class SelfHealingRouter:
             if not path or cost == float("inf"):
                 # No path — escalate to LLM
                 llm_calls += 1
+                outcome = ExecutionOutcome.ESCALATED
                 escalation_result = self.escalation.escalate(
                     failed_tool=start,
                     attempted_paths=attempted_paths,
                     context={"outputs": outputs, "errors": errors, "data": data},
+                    start_goal=start,
+                    end_goal=end,
                 )
                 
+                execution_log.append({
+                    "step": "escalation",
+                    "tool": start,
+                    "success": False,
+                    "detail": escalation_result.detail,
+                })
+
                 if escalation_result.action == "retry":
                     # LLM says retry — recover all failed tools and try again
                     for tool_name in self.monitors.failed_tools():
@@ -171,6 +206,8 @@ class SelfHealingRouter:
                         reroutes=reroutes,
                         llm_calls=llm_calls,
                         errors=errors + [escalation_result.detail],
+                        outcome=outcome,
+                        execution_log=execution_log,
                     )
 
             attempted_paths.append(path)
@@ -185,9 +222,19 @@ class SelfHealingRouter:
                     if tool_name in outputs:
                         current_data = outputs[tool_name] if isinstance(outputs[tool_name], dict) else current_data
                     continue
-                    
+
+                step_start = time.monotonic()
                 success, result = self._execute_tool(tool_name, current_data)
-                
+                step_elapsed = (time.monotonic() - step_start) * 1000
+
+                execution_log.append({
+                    "step": "execute",
+                    "tool": tool_name,
+                    "success": success,
+                    "latency_ms": step_elapsed,
+                    "reroute": reroutes > 0,
+                })
+
                 if success:
                     outputs[tool_name] = result
                     if isinstance(result, dict):
@@ -221,6 +268,8 @@ class SelfHealingRouter:
                     reroutes=reroutes,
                     llm_calls=llm_calls,
                     errors=errors,
+                    outcome=outcome,
+                    execution_log=execution_log,
                 )
 
         # Exceeded max reroutes
@@ -232,6 +281,8 @@ class SelfHealingRouter:
             reroutes=reroutes,
             llm_calls=llm_calls,
             errors=errors + [f"Max reroutes ({self._max_reroutes}) exceeded"],
+            outcome=ExecutionOutcome.MAX_REROUTES,
+            execution_log=execution_log,
         )
 
     def health_report(self) -> str:
