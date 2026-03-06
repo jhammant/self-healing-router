@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .types import EscalationResult, EscalationCallback
+from .types import EscalationResult, EscalationCallback, GoalDemotion
 
 
 class EscalationHandler:
@@ -36,6 +36,8 @@ class EscalationHandler:
         failed_tool: str,
         attempted_paths: list[list[str]],
         context: dict[str, Any] | None = None,
+        start_goal: str | None = None,
+        end_goal: str | None = None,
     ) -> EscalationResult:
         """Escalate to LLM for decision.
         
@@ -56,6 +58,10 @@ class EscalationHandler:
             "max_escalations": self._max_escalations,
             **(context or {}),
         }
+        if start_goal is not None:
+            escalation_context["start_goal"] = start_goal
+        if end_goal is not None:
+            escalation_context["end_goal"] = end_goal
         
         self._history.append(escalation_context)
 

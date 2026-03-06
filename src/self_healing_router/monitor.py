@@ -6,7 +6,7 @@ import time
 from collections import deque
 from typing import Any, Callable
 
-from .types import ToolStatus, HealthReport
+from .types import ToolStatus, HealthReport, CircuitBreakerState
 
 
 class HealthMonitor:
@@ -32,16 +32,38 @@ class HealthMonitor:
         self._outcomes: deque[bool] = deque(maxlen=window_size)  # True=success
         self._custom_signals: dict[str, float] = {}
 
+        # Circuit breaker state
+        self._circuit_state: CircuitBreakerState = CircuitBreakerState.CLOSED
+        self._open_since: float | None = None
+        self._recovery_timeout: float = 30.0
+        self._consecutive_failures: int = 0
+        self._failure_threshold: int = 3
+
+        # Rate limit tracking
+        self._rate_limit_remaining: int | None = None
+        self._rate_limit_total: int | None = None
+
+        # Proactive health check
+        self._health_check: Callable[[], bool] | None = None
+
     def record_success(self, latency_ms: float) -> None:
         """Record a successful tool invocation."""
         self._latencies.append(latency_ms)
         self._outcomes.append(True)
+        self._consecutive_failures = 0
+        if self._circuit_state == CircuitBreakerState.HALF_OPEN:
+            self._circuit_state = CircuitBreakerState.CLOSED
+            self._open_since = None
 
     def record_failure(self, latency_ms: float = 0.0) -> None:
         """Record a failed tool invocation."""
         if latency_ms > 0:
             self._latencies.append(latency_ms)
         self._outcomes.append(False)
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._failure_threshold:
+            self._circuit_state = CircuitBreakerState.OPEN
+            self._open_since = time.monotonic()
 
     def set_signal(self, name: str, value: float) -> None:
         """Set a custom health signal (e.g., queue depth, memory usage)."""
@@ -61,6 +83,28 @@ class HealthMonitor:
             return None
         failures = sum(1 for o in self._outcomes if not o)
         return failures / len(self._outcomes)
+
+    @property
+    def circuit_state(self) -> CircuitBreakerState:
+        """Current circuit breaker state, with auto-transition from OPEN to HALF_OPEN."""
+        if (
+            self._circuit_state == CircuitBreakerState.OPEN
+            and self._open_since is not None
+            and (time.monotonic() - self._open_since) >= self._recovery_timeout
+        ):
+            self._circuit_state = CircuitBreakerState.HALF_OPEN
+        return self._circuit_state
+
+    def trip(self) -> None:
+        """Manually trip the circuit breaker to OPEN."""
+        self._circuit_state = CircuitBreakerState.OPEN
+        self._open_since = time.monotonic()
+
+    def reset_circuit(self) -> None:
+        """Manually reset the circuit breaker to CLOSED."""
+        self._circuit_state = CircuitBreakerState.CLOSED
+        self._open_since = None
+        self._consecutive_failures = 0
 
     @property
     def status(self) -> ToolStatus:
@@ -108,18 +152,133 @@ class HealthMonitor:
         """Compute weight penalty for edge reweighting.
         
         Returns a multiplier: 1.0 = healthy, inf = failed.
+        Circuit breaker state takes precedence.
         """
+        cs = self.circuit_state
+        if cs == CircuitBreakerState.OPEN:
+            return float("inf")
+        if cs == CircuitBreakerState.HALF_OPEN:
+            return 10.0
+
+        # CLOSED — use normal status-based calculation
         status = self.status
         if status == ToolStatus.FAILED:
             return float("inf")
         if status == ToolStatus.DEGRADED:
-            # Scale penalty with error rate
             err = self.error_rate or 0.0
             lat_penalty = 1.0
             if self.avg_latency_ms and self.avg_latency_ms > self.latency_threshold_ms:
                 lat_penalty = self.avg_latency_ms / self.latency_threshold_ms
             return 2.0 + (err * 5.0) + lat_penalty
         return 1.0
+
+    # --- Rate Limit ---
+
+    def set_rate_limit(self, remaining: int, total: int) -> None:
+        """Update rate limit information."""
+        self._rate_limit_remaining = remaining
+        self._rate_limit_total = total
+
+    def rate_limit_factor(self) -> float:
+        """Rate limit penalty factor.
+        
+        Returns 1.0 when plenty of quota, spikes near limit, inf at 0.
+        """
+        if self._rate_limit_remaining is None or self._rate_limit_total is None:
+            return 1.0
+        if self._rate_limit_total == 0:
+            return 1.0
+        if self._rate_limit_remaining <= 0:
+            return float("inf")
+        ratio = self._rate_limit_remaining / self._rate_limit_total
+        if ratio > 0.5:
+            return 1.0
+        if ratio > 0.2:
+            return 2.0
+        if ratio > 0.1:
+            return 10.0
+        if ratio > 0.05:
+            return 50.0
+        return 100.0
+
+    # --- Composite Weight ---
+
+    def composite_weight(self, base_cost: float = 1.0) -> float:
+        """W(tool) = base_cost × latency(t) × reliability(t) × rate_limit(t) × availability(t)"""
+        # Availability based on circuit state
+        cs = self.circuit_state
+        if cs == CircuitBreakerState.OPEN:
+            return float("inf")
+        availability = 10.0 if cs == CircuitBreakerState.HALF_OPEN else 1.0
+
+        # Latency factor: ratio of avg latency to threshold, clamped [0.5, 10.0]
+        lat = self.avg_latency_ms
+        if lat is not None and self.latency_threshold_ms > 0:
+            latency_f = max(0.5, min(10.0, lat / self.latency_threshold_ms))
+        else:
+            latency_f = 1.0
+
+        # Reliability factor: 1/(1-error_rate), clamped [1.0, 50.0]
+        err = self.error_rate
+        if err is not None and err < 1.0:
+            reliability_f = max(1.0, min(50.0, 1.0 / (1.0 - err)))
+        elif err is not None:
+            reliability_f = 50.0
+        else:
+            reliability_f = 1.0
+
+        # Rate limit factor
+        rl_f = self.rate_limit_factor()
+        if rl_f == float("inf"):
+            return float("inf")
+
+        return base_cost * latency_f * reliability_f * rl_f * availability
+
+    # --- Priority Signal ---
+
+    def priority_signal(self) -> "PrioritySignal":
+        """Produce a priority signal based on current state."""
+        from .priority import PrioritySignal
+
+        status = self.status
+        cs = self.circuit_state
+
+        if status == ToolStatus.FAILED or cs == CircuitBreakerState.OPEN:
+            score = 0.99
+        elif status == ToolStatus.DEGRADED or cs == CircuitBreakerState.HALF_OPEN:
+            score = 0.70
+        elif status == ToolStatus.UNKNOWN:
+            score = 0.30
+        else:
+            score = 0.10
+
+        return PrioritySignal(
+            name=f"{self.tool_name}_health",
+            score=score,
+            source=self.tool_name,
+            detail=f"status={status.value}, circuit={cs.value}",
+        )
+
+    # --- Proactive Health Check ---
+
+    def set_health_check(self, fn: Callable[[], bool]) -> None:
+        """Set a health check function that returns True if healthy."""
+        self._health_check = fn
+
+    def run_health_check(self) -> bool:
+        """Run the health check, updating metrics."""
+        if self._health_check is None:
+            return True
+        try:
+            result = self._health_check()
+            if result:
+                self.record_success(0.0)
+            else:
+                self.record_failure(0.0)
+            return result
+        except Exception:
+            self.record_failure(0.0)
+            return False
 
 
 class MonitorRegistry:
@@ -160,3 +319,7 @@ class MonitorRegistry:
             name for name, m in self._monitors.items()
             if m.status == ToolStatus.FAILED
         ]
+
+    def run_all_health_checks(self) -> dict[str, bool]:
+        """Run health checks on all registered monitors."""
+        return {name: m.run_health_check() for name, m in self._monitors.items()}

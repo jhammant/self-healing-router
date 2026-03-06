@@ -26,10 +26,14 @@ from .types import (
     HealthReport,
     RouteResult,
     EscalationResult,
+    CircuitBreakerState,
+    GoalDemotion,
+    ExecutionOutcome,
 )
 from .graph import ToolGraph
 from .monitor import HealthMonitor, MonitorRegistry
 from .escalation import EscalationHandler, default_escalation
+from .priority import PrioritySignal, PriorityArbiter
 from .router import SelfHealingRouter
 
 __all__ = [
@@ -45,4 +49,9 @@ __all__ = [
     "HealthReport",
     "RouteResult",
     "EscalationResult",
+    "CircuitBreakerState",
+    "GoalDemotion",
+    "ExecutionOutcome",
+    "PrioritySignal",
+    "PriorityArbiter",
 ]
