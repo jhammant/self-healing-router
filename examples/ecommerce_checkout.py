@@ -131,7 +131,7 @@ def main():
             {"name": "USB-C Cable", "price": 12.99, "qty": 2},
         ],
         "email": "alice@example.com",
-        "phone": "+447958781880",
+        "phone": "+44700000000",
     }
 
     # --- Scenario 1: Happy path (Stripe works) ---
